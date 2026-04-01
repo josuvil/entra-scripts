@@ -11,6 +11,13 @@
 # ================================
 # Microsoft Graph – Security Group serviceProvisioningErrors Scan
 # Parallel + Adaptive Throttling + Per-Runspace Backoff + Progress/ETA + File Output
+# v6.2 – enhancements applied:
+#   - Capture errorDetail field in error records (key diagnostic data previously omitted)
+#   - Write full per-error detail rows to output CSV (previously only summary counts)
+#   - try/finally ensures Disconnect-MgGraph + Stop-Transcript on all exit paths
+#   - Replace exit 0 with return so finally block runs on zero-groups early-out
+#   - Remove individual Stop-Transcript calls before throw (superseded by finally)
+#   - Remove redundant [datetime] cast on StartTime (already datetime)
 # v6.1 – corrections applied:
 #   - Fix invalid PowerShell syntax (no :Min/:Max/:Synchronized tokens)
 #   - Remove manual CSV quote escaping (Export-Csv already escapes)
@@ -49,7 +56,8 @@ $RequiredScopes = @(
     'Directory.Read.All'
 )
 
-# Output directory — timestamped files are written here; created if absent
+# Output directory — timestamped files are written here; created if absent.
+# ⚠️ SECURITY: Output may contain sensitive group/error data. Restrict Access Control Lists (ACLs) on this directory.
 $OutDir = 'C:\Temp'
 
 # ================================================================
@@ -123,6 +131,8 @@ $TranscriptFile = Join-Path $OutDir "sg_errors_transcript_$RunStamp.log"
 Start-Transcript -Path $TranscriptFile -Append
 Write-Host "Transcript : $TranscriptFile" -ForegroundColor DarkGray
 
+try {
+
 # ================================================================
 # CONNECT TO GRAPH
 # ================================================================
@@ -132,7 +142,6 @@ Write-Host "Connecting to Microsoft Graph (mode: $AuthMode)..." -ForegroundColor
 switch ($AuthMode) {
     'ServicePrincipal' {
         if (-not $AppId -or -not $TenantId -or -not $CertificateThumbprint) {
-            Stop-Transcript
             throw "AuthMode is 'ServicePrincipal' but one or more credentials are empty. Populate `$AppId, `$TenantId, and `$CertificateThumbprint."
         }
         Connect-MgGraph -ClientId $AppId -TenantId $TenantId -CertificateThumbprint $CertificateThumbprint -NoWelcome -ContextScope Process
@@ -145,7 +154,6 @@ switch ($AuthMode) {
         Connect-MgGraph -Scopes $RequiredScopes -NoWelcome -ContextScope Process
     }
     default {
-        Stop-Transcript
         throw "Unknown AuthMode '$AuthMode'. Valid values: ServicePrincipal | ManagedIdentity | Interactive"
     }
 }
@@ -165,14 +173,12 @@ if ($ctx.AuthType -eq 'AppOnly') {
         Write-Host "Permission probe passed." -ForegroundColor Green
     }
     catch {
-        Stop-Transcript
         throw "Pre-flight permission probe failed. Verify the app has Group.Read.All and Directory.Read.All APPLICATION permissions with admin consent. Error: $_"
     }
 }
 else {
     $missingScopes = $RequiredScopes | Where-Object { $_ -notin $ctx.Scopes }
     if ($missingScopes) {
-        Stop-Transcript
         throw "Missing required delegated scopes: $($missingScopes -join ', '). Re-run Connect-MgGraph with the correct -Scopes."
     }
     Write-Host "Delegated scopes confirmed: $($RequiredScopes -join ', ')" -ForegroundColor Green
@@ -196,8 +202,7 @@ Write-Host "Loaded $TotalGroups security groups." -ForegroundColor Green
 
 if ($TotalGroups -eq 0) {
     Write-Warning "No security groups found. Verify your filter, permissions, and tenant."
-    Stop-Transcript
-    exit 0
+    return
 }
 
 # ================================================================
@@ -240,6 +245,7 @@ $job = $SecurityGroups | ForEach-Object -Parallel {
                             ServiceInstance = $err['serviceInstance']
                             CreatedDateTime = $err['createdDateTime']
                             IsResolved      = $err['isResolved']
+                            ErrorDetail     = $err['errorDetail']
                         })
                     }
                 }
@@ -299,7 +305,7 @@ $job = $SecurityGroups | ForEach-Object -Parallel {
 # PROGRESS BAR + ETA
 # ================================================================
 
-$StartTime = [datetime]$Shared.StartTimeUtc
+$StartTime = $Shared.StartTimeUtc
 
 while ($job.State -eq 'Running') {
 
@@ -335,30 +341,22 @@ Write-Host "Groups skipped      : $($Skipped.Count)" -ForegroundColor $(if ($Ski
 
 $ScanStartLocal = ([datetime]$Shared.StartTimeUtc).ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss')
 
-$groupsWithErrors =
-    $Results |
-    Group-Object GroupId |
-    ForEach-Object {
-        $first = $_.Group[0]
-        [pscustomobject]@{
-            GroupId      = $first.GroupId
-            GroupName    = $first.GroupName
-            ErrorRecords = $_.Count
-        }
-    } |
-    Sort-Object GroupName
+# Derive distinct-group count for the CSV header; full detail rows go into the file.
+$groupsWithErrors = ($Results | Select-Object -ExpandProperty GroupId -Unique | Measure-Object).Count
 
 @(
-    "# Security Groups with serviceProvisioningErrors"
+    "# Security Groups with serviceProvisioningErrors — full error detail"
     "# ScanStarted:        $ScanStartLocal"
     "# TotalGroupsScanned: $finalProcessed"
-    "# GroupsWithErrors:   $($groupsWithErrors.Count)"
+    "# GroupsWithErrors:   $groupsWithErrors"
     "# GroupsSkipped:      $($Skipped.Count)"
     "# Transcript:         $TranscriptFile"
+    "# Columns: GroupId, GroupName, ServiceInstance, CreatedDateTime, IsResolved, ErrorDetail"
     "#"
 ) | Set-Content -Path $OutFile -Encoding UTF8
 
-$groupsWithErrors |
+$Results |
+    Sort-Object GroupName, CreatedDateTime |
     Export-Csv -Path $OutFile -Encoding UTF8 -NoTypeInformation -Append
 
 Write-Host "Results    : $OutFile" -ForegroundColor Green
@@ -387,7 +385,12 @@ else {
 
 Write-Host "Transcript : $TranscriptFile" -ForegroundColor DarkGray
 
-Stop-Transcript
-
 # Return full error records to pipeline — caller can pipe to Export-Csv / ConvertTo-Json
 $Results
+
+}
+finally {
+    # Always disconnect from Microsoft Graph and stop the transcript, regardless of how the script exits.
+    try { Disconnect-MgGraph | Out-Null } catch { }
+    Stop-Transcript
+}
