@@ -11,6 +11,13 @@
 # ================================
 # Microsoft Graph – Security Group serviceProvisioningErrors Scan
 # Parallel + Adaptive Throttling + Per-Runspace Backoff + Progress/ETA + File Output
+# v6.3 – security and correctness fixes:
+#   - Move Start-Transcript inside try block so finally always closes it
+#   - Replace non-atomic Throttles429++ with [Interlocked]::Increment (race-free counter)
+#   - Fix null $statusCode producing misleading "Error_HTTP" reason; now "NetworkError"
+#   - Remove redundant [datetime] cast on StartTimeUtc when writing $ScanStartLocal
+#   - Add output-directory ACL guardrail (warns if directory is world-writable/group-writable)
+#   - Add $CertificateThumbprint hex-format validation for ServicePrincipal mode
 # v6.2 – enhancements applied:
 #   - Capture errorDetail field in error records (key diagnostic data previously omitted)
 #   - Write full per-error detail rows to output CSV (previously only summary counts)
@@ -128,10 +135,49 @@ $OutFile        = Join-Path $OutDir "sg_errors_$RunStamp.csv"
 $SkippedFile    = Join-Path $OutDir "sg_errors_skipped_$RunStamp.csv"
 $TranscriptFile = Join-Path $OutDir "sg_errors_transcript_$RunStamp.log"
 
+try {
+
+# ================================================================
+# OUTPUT DIRECTORY ACL GUARDRAIL
+# ================================================================
+# Warn if the output directory grants write access to accounts other than
+# the current user/SYSTEM (e.g. world-writable or group-writable).
+# Output files may contain sensitive serviceProvisioningErrors data.
+# ⚠️ SECURITY: Restrict ACLs on $OutDir before running in production.
+
+if ($IsWindows -or (-not $IsLinux -and -not $IsMacOS)) {
+    try {
+        $acl = Get-Acl -Path $OutDir -ErrorAction Stop
+        $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $sensitiveAccess = $acl.Access | Where-Object {
+            ($_.FileSystemRights -band (
+                [System.Security.AccessControl.FileSystemRights]::Write -bor
+                [System.Security.AccessControl.FileSystemRights]::Modify -bor
+                [System.Security.AccessControl.FileSystemRights]::FullControl
+            )) -and
+            $_.AccessControlType -eq 'Allow' -and
+            $_.IdentityReference.Value -notin @(
+                $currentUser,
+                'NT AUTHORITY\SYSTEM',
+                'BUILTIN\Administrators'
+            )
+        }
+        if ($sensitiveAccess) {
+            $identities = $sensitiveAccess.IdentityReference.Value -join ', '
+            Write-Warning "OUTPUT DIRECTORY ACL WARNING: '$OutDir' grants write access to: $identities. Output files may contain sensitive data. Restrict ACLs before running in production."
+        }
+    }
+    catch {
+        Write-Warning "Could not check ACLs on '$OutDir': $_"
+    }
+}
+
+# ================================================================
+# TRANSCRIPT
+# ================================================================
+
 Start-Transcript -Path $TranscriptFile -Append
 Write-Host "Transcript : $TranscriptFile" -ForegroundColor DarkGray
-
-try {
 
 # ================================================================
 # CONNECT TO GRAPH
@@ -143,6 +189,10 @@ switch ($AuthMode) {
     'ServicePrincipal' {
         if (-not $AppId -or -not $TenantId -or -not $CertificateThumbprint) {
             throw "AuthMode is 'ServicePrincipal' but one or more credentials are empty. Populate `$AppId, `$TenantId, and `$CertificateThumbprint."
+        }
+        # Validate thumbprint format: must be exactly 40 hex characters.
+        if ($CertificateThumbprint -notmatch '^[0-9A-Fa-f]{40}$') {
+            throw "CertificateThumbprint '$CertificateThumbprint' is not a valid certificate thumbprint (expected 40 hex characters)."
         }
         Connect-MgGraph -ClientId $AppId -TenantId $TenantId -CertificateThumbprint $CertificateThumbprint -NoWelcome -ContextScope Process
     }
@@ -210,7 +260,7 @@ if ($TotalGroups -eq 0) {
 # ================================================================
 
 $Shared = [hashtable]::Synchronized(@{
-    Throttles429 = 0
+    Throttles429 = [ref]0
     StartTimeUtc = (Get-Date).ToUniversalTime()
 })
 
@@ -259,7 +309,8 @@ $job = $SecurityGroups | ForEach-Object -Parallel {
 
                 if ($statusCode -eq 429 -and $Retry -lt $using:MaxRetries) {
                     # Throttling: honor Retry-After when present; otherwise backoff. [1](https://learn.microsoft.com/en-us/graph/throttling)
-                    ($using:Shared).Throttles429++
+                    # Interlocked.Increment ensures atomic counter update across runspaces.
+                    [System.Threading.Interlocked]::Increment(($using:Shared).Throttles429)
 
                     $retryAfter = $null
                     try { $retryAfter = [int]$_.Exception.Response.Headers["Retry-After"] } catch { }
@@ -277,6 +328,7 @@ $job = $SecurityGroups | ForEach-Object -Parallel {
                         401     { 'AuthExpired_401' }
                         403     { 'Forbidden_403' }
                         429     { 'RetryBudgetExhausted_429' }
+                        $null   { 'NetworkError' }
                         default { "Error_HTTP$statusCode" }
                     }
 
@@ -318,7 +370,7 @@ while ($job.State -eq 'Running') {
     $percent    = [Math]::Max(0, [Math]::Min(100, [int][Math]::Floor(($processed / $TotalGroups) * 100)))
 
     Write-Progress -Activity "Scanning Security Groups for serviceProvisioningErrors" `
-                   -Status   "Processed $processed / $TotalGroups | 429s: $($Shared.Throttles429) | Skipped: $($Skipped.Count)" `
+                   -Status   "Processed $processed / $TotalGroups | 429s: $($Shared.Throttles429.Value) | Skipped: $($Skipped.Count)" `
                    -PercentComplete  $percent `
                    -SecondsRemaining $etaSeconds
 
@@ -339,7 +391,7 @@ Write-Host "Groups skipped      : $($Skipped.Count)" -ForegroundColor $(if ($Ski
 # WRITE OUTPUT FILES
 # ================================================================
 
-$ScanStartLocal = ([datetime]$Shared.StartTimeUtc).ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss')
+$ScanStartLocal = $Shared.StartTimeUtc.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss')
 
 # Derive distinct-group count for the CSV header; full detail rows go into the file.
 $groupsWithErrors = ($Results | Select-Object -ExpandProperty GroupId -Unique | Measure-Object).Count
@@ -365,7 +417,7 @@ if ($Skipped.Count -gt 0) {
     @(
         "# Groups skipped during scan"
         "# ScanStarted:  $ScanStartLocal"
-        "# Reason codes: AuthExpired_401 | Forbidden_403 | RetryBudgetExhausted_429 | Error_HTTPNNN"
+        "# Reason codes: AuthExpired_401 | Forbidden_403 | RetryBudgetExhausted_429 | NetworkError | Error_HTTPNNN"
         "#"
     ) | Set-Content -Path $SkippedFile -Encoding UTF8
 
