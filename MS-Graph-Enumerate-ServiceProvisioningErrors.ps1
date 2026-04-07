@@ -292,6 +292,7 @@ $job = $SecurityGroups | ForEach-Object -Parallel {
                         ($using:Results).Add([pscustomobject]@{
                             GroupId         = $Group.Id
                             GroupName       = $Group.DisplayName
+                            ODataType       = $err['@odata.type']
                             ServiceInstance = $err['serviceInstance']
                             CreatedDateTime = $err['createdDateTime']
                             IsResolved      = $err['isResolved']
@@ -403,7 +404,7 @@ $groupsWithErrors = ($Results | Select-Object -ExpandProperty GroupId -Unique | 
     "# GroupsWithErrors:   $groupsWithErrors"
     "# GroupsSkipped:      $($Skipped.Count)"
     "# Transcript:         $TranscriptFile"
-    "# Columns: GroupId, GroupName, ServiceInstance, CreatedDateTime, IsResolved, ErrorDetail"
+    "# Columns: GroupId, GroupName, ODataType, ServiceInstance, CreatedDateTime, IsResolved, ErrorDetail"
     "#"
 ) | Set-Content -Path $OutFile -Encoding UTF8
 
