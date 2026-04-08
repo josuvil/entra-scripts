@@ -11,6 +11,13 @@
 # ================================
 # Microsoft Graph – Security Group serviceProvisioningErrors Scan
 # Parallel + Adaptive Throttling + Per-Runspace Backoff + Progress/ETA + File Output
+# v6.4 – guardrail fixes for large-scale (25k–100k) directories:
+#   - Wrap Stop-Transcript in finally with try/catch (mirrors Disconnect-MgGraph guard;
+#     prevents finally from masking original exception when transcript was never started)
+#   - Capture runspace errors from Receive-Job via -ErrorVariable instead of silently
+#     discarding them with Out-Null (exposes groups that fell through all inner catch blocks)
+#   - Warn when finalProcessed < TotalGroups (unaccounted gap signals runspace crashes)
+#   - Print total 429 count in post-scan summary (key operational diagnostic for large tenants)
 # v6.3 – security and correctness fixes:
 #   - Move Start-Transcript inside try block so finally always closes it
 #   - Replace non-atomic Throttles429++ with [Interlocked]::Increment (race-free counter)
@@ -378,15 +385,27 @@ while ($job.State -eq 'Running') {
     Start-Sleep -Milliseconds 750
 }
 
-Receive-Job -Job $job -Wait | Out-Null
+$jobErrors = @()
+Receive-Job -Job $job -Wait -ErrorVariable jobErrors | Out-Null
 Remove-Job  -Job $job -Force
+
+if ($jobErrors.Count -gt 0) {
+    Write-Warning "$($jobErrors.Count) runspace error(s) were raised during parallel scan. Some groups may not have been processed or recorded."
+    foreach ($je in $jobErrors) { Write-Warning "  Runspace error: $je" }
+}
 
 Write-Progress -Activity "Scanning Security Groups for serviceProvisioningErrors" -Completed
 
 $finalProcessed = [int]$ProcessedMarkers.Count
 Write-Host "Scan complete. Scanned $finalProcessed of $TotalGroups groups." -ForegroundColor Green
+Write-Host "Total 429s seen     : $($Shared.Throttles429.Value)" -ForegroundColor DarkGray
 Write-Host "Error records found : $($Results.Count)" -ForegroundColor Yellow
 Write-Host "Groups skipped      : $($Skipped.Count)" -ForegroundColor $(if ($Skipped.Count -gt 0) { 'Red' } else { 'Green' })
+
+$unaccounted = $TotalGroups - $finalProcessed
+if ($unaccounted -gt 0) {
+    Write-Warning "$unaccounted group(s) were neither scanned nor recorded as skipped. This likely indicates runspace failures. Re-run to recover missing coverage."
+}
 
 # ================================================================
 # WRITE OUTPUT FILES
@@ -445,5 +464,5 @@ $Results
 finally {
     # Always disconnect from Microsoft Graph and stop the transcript, regardless of how the script exits.
     try { Disconnect-MgGraph | Out-Null } catch { }
-    Stop-Transcript
+    try { Stop-Transcript }              catch { }
 }
