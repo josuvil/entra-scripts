@@ -11,6 +11,11 @@
 # ================================
 # Microsoft Graph – Security Group serviceProvisioningErrors Scan
 # Parallel + Adaptive Throttling + Per-Runspace Backoff + Progress/ETA + File Output
+# v6.5 – bug fixes and enhancements:
+#   - Replace em dash in CSV header title with ASCII hyphen (fixes â€" in non-UTF-8 viewers)
+#   - Format TotalGroupsScanned with comma thousands separator (e.g., 26,589)
+#   - Remove redundant '# Columns:' comment row from CSV header
+#   - Add ElapsedTime (HH:MM:SS) to CSV header
 # v6.4 – guardrail fixes for large-scale (25k–100k) directories:
 #   - Wrap Stop-Transcript in finally with try/catch (mirrors Disconnect-MgGraph guard;
 #     prevents finally from masking original exception when transcript was never started)
@@ -413,17 +418,20 @@ if ($unaccounted -gt 0) {
 
 $ScanStartLocal = $Shared.StartTimeUtc.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss')
 
+$ElapsedTime      = (Get-Date).ToUniversalTime() - $Shared.StartTimeUtc
+$ElapsedFormatted = '{0:D2}:{1:D2}:{2:D2}' -f [int]$ElapsedTime.TotalHours, $ElapsedTime.Minutes, $ElapsedTime.Seconds
+
 # Derive distinct-group count for the CSV header; full detail rows go into the file.
 $groupsWithErrors = ($Results | Select-Object -ExpandProperty GroupId -Unique | Measure-Object).Count
 
 @(
-    "# Security Groups with serviceProvisioningErrors — full error detail"
+    "# Security Groups with serviceProvisioningErrors - full error detail"
     "# ScanStarted:        $ScanStartLocal"
-    "# TotalGroupsScanned: $finalProcessed"
+    "# TotalGroupsScanned: $('{0:N0}' -f $finalProcessed)"
     "# GroupsWithErrors:   $groupsWithErrors"
     "# GroupsSkipped:      $($Skipped.Count)"
+    "# ElapsedTime:        $ElapsedFormatted"
     "# Transcript:         $TranscriptFile"
-    "# Columns: GroupId, GroupName, ODataType, ServiceInstance, CreatedDateTime, IsResolved, ErrorDetail"
     "#"
 ) | Set-Content -Path $OutFile -Encoding UTF8
 
