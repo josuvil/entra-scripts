@@ -5,12 +5,20 @@
 # ================================
 # PURPOSE
 # ================================
-# Enumerate ALL security groups in the current Microsoft Entra ID tenant and
-# output the groups that have serviceProvisioningErrors, using Microsoft Graph.
+# Enumerate ALL security groups AND distribution groups in the current
+# Microsoft Entra ID tenant and output the groups that have
+# serviceProvisioningErrors, using Microsoft Graph.
 #
 # ================================
-# Microsoft Graph – Security Group serviceProvisioningErrors Scan
+# Microsoft Graph – Security Group + Distribution Group serviceProvisioningErrors Scan
 # Parallel + Adaptive Throttling + Per-Runspace Backoff + Progress/ETA + File Output
+# v7.0 – add distribution group support:
+#   - Load distribution groups (mailEnabled eq true AND securityEnabled eq false)
+#     in addition to security groups and scan both for serviceProvisioningErrors
+#   - Add GroupType column (SecurityGroup | DistributionGroup) to results and skipped CSVs
+#   - Rename output files from sg_errors_* to group_errors_* to reflect broader scope
+#   - Combined early-exit guard: abort only when BOTH group types return zero results
+#   - Updated progress bar, scan-complete messages, and CSV header comments
 # v6.5 – bug fixes and enhancements:
 #   - Replace em dash in CSV header title with ASCII hyphen (fixes â€" in non-UTF-8 viewers)
 #   - Format TotalGroupsScanned with comma thousands separator (e.g., 26,589)
@@ -143,9 +151,9 @@ Write-Host "Module pre-flight passed (Microsoft.Graph.Authentication, Microsoft.
 $null     = New-Item -ItemType Directory -Path $OutDir -Force
 $RunStamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 
-$OutFile        = Join-Path $OutDir "sg_errors_$RunStamp.csv"
-$SkippedFile    = Join-Path $OutDir "sg_errors_skipped_$RunStamp.csv"
-$TranscriptFile = Join-Path $OutDir "sg_errors_transcript_$RunStamp.log"
+$OutFile        = Join-Path $OutDir "group_errors_$RunStamp.csv"
+$SkippedFile    = Join-Path $OutDir "group_errors_skipped_$RunStamp.csv"
+$TranscriptFile = Join-Path $OutDir "group_errors_transcript_$RunStamp.log"
 
 try {
 
@@ -247,7 +255,7 @@ else {
 }
 
 # ================================================================
-# STEP 1: LOAD ALL SECURITY GROUPS
+# STEP 1: LOAD ALL SECURITY GROUPS AND DISTRIBUTION GROUPS
 # ================================================================
 
 Write-Host "Loading Security Groups into memory..." -ForegroundColor Cyan
@@ -257,13 +265,28 @@ $SecurityGroups =
         -Filter "securityEnabled eq true" `
         -Property "id,displayName,groupTypes" |
     Where-Object { $_.GroupTypes -notcontains 'Unified' } |
-    Select-Object Id, DisplayName
+    Select-Object Id, DisplayName, @{ Name = 'GroupType'; Expression = { 'SecurityGroup' } }
 
-$TotalGroups = $SecurityGroups.Count
-Write-Host "Loaded $TotalGroups security groups." -ForegroundColor Green
+Write-Host "Loaded $($SecurityGroups.Count) security groups." -ForegroundColor Green
+
+Write-Host "Loading Distribution Groups into memory..." -ForegroundColor Cyan
+
+$DistributionGroups =
+    Get-MgGroup -All `
+        -Filter "mailEnabled eq true and securityEnabled eq false" `
+        -Property "id,displayName,groupTypes" |
+    Select-Object Id, DisplayName, @{ Name = 'GroupType'; Expression = { 'DistributionGroup' } }
+
+Write-Host "Loaded $($DistributionGroups.Count) distribution groups." -ForegroundColor Green
+
+$AllGroups = [System.Collections.Generic.List[object]]::new()
+if ($SecurityGroups)    { $AllGroups.AddRange([object[]]$SecurityGroups) }
+if ($DistributionGroups){ $AllGroups.AddRange([object[]]$DistributionGroups) }
+$TotalGroups = $AllGroups.Count
+Write-Host "Total groups to scan: $TotalGroups (security: $($SecurityGroups.Count), distribution: $($DistributionGroups.Count))." -ForegroundColor Cyan
 
 if ($TotalGroups -eq 0) {
-    Write-Warning "No security groups found. Verify your filter, permissions, and tenant."
+    Write-Warning "No security groups or distribution groups found. Verify your filter, permissions, and tenant."
     return
 }
 
@@ -282,7 +305,7 @@ $ProcessedMarkers = [System.Collections.Concurrent.ConcurrentBag[int]]::new()
 
 Write-Host "Scanning groups for serviceProvisioningErrors (parallel, throttle-safe)..." -ForegroundColor Cyan
 
-$job = $SecurityGroups | ForEach-Object -Parallel {
+$job = $AllGroups | ForEach-Object -Parallel {
 
     $Group   = $_
     $Backoff = $using:InitialBackoffSec
@@ -304,6 +327,7 @@ $job = $SecurityGroups | ForEach-Object -Parallel {
                         ($using:Results).Add([pscustomobject]@{
                             GroupId         = $Group.Id
                             GroupName       = $Group.DisplayName
+                            GroupType       = $Group.GroupType
                             ODataType       = $err['@odata.type']
                             ServiceInstance = $err['serviceInstance']
                             CreatedDateTime = $err['createdDateTime']
@@ -348,6 +372,7 @@ $job = $SecurityGroups | ForEach-Object -Parallel {
                     ($using:Skipped).Add([pscustomobject]@{
                         GroupId   = $Group.Id
                         GroupName = $Group.DisplayName
+                        GroupType = $Group.GroupType
                         Reason    = $reason
                         Detail    = $_.ToString()
                     })
@@ -382,7 +407,7 @@ while ($job.State -eq 'Running') {
     $etaSeconds = if ($rate -gt 0) { [int][Math]::Ceiling($remaining / $rate) } else { -1 }
     $percent    = [Math]::Max(0, [Math]::Min(100, [int][Math]::Floor(($processed / $TotalGroups) * 100)))
 
-    Write-Progress -Activity "Scanning Security Groups for serviceProvisioningErrors" `
+    Write-Progress -Activity "Scanning Security + Distribution Groups for serviceProvisioningErrors" `
                    -Status   "Processed $processed / $TotalGroups | 429s: $($Shared.Throttles429.Value) | Skipped: $($Skipped.Count)" `
                    -PercentComplete  $percent `
                    -SecondsRemaining $etaSeconds
@@ -399,7 +424,7 @@ if ($jobErrors.Count -gt 0) {
     foreach ($je in $jobErrors) { Write-Warning "  Runspace error: $je" }
 }
 
-Write-Progress -Activity "Scanning Security Groups for serviceProvisioningErrors" -Completed
+Write-Progress -Activity "Scanning Security + Distribution Groups for serviceProvisioningErrors" -Completed
 
 $finalProcessed = [int]$ProcessedMarkers.Count
 Write-Host "Scan complete. Scanned $finalProcessed of $TotalGroups groups." -ForegroundColor Green
@@ -425,7 +450,7 @@ $ElapsedFormatted = '{0:D2}:{1:D2}:{2:D2}' -f [int]$ElapsedTime.TotalHours, $Ela
 $groupsWithErrors = ($Results | Select-Object -ExpandProperty GroupId -Unique | Measure-Object).Count
 
 @(
-    "# Security Groups with serviceProvisioningErrors - full error detail"
+    "# Security Groups and Distribution Groups with serviceProvisioningErrors - full error detail"
     "# ScanStarted:        $ScanStartLocal"
     "# TotalGroupsScanned: $('{0:N0}' -f $finalProcessed)"
     "# GroupsWithErrors:   $groupsWithErrors"
