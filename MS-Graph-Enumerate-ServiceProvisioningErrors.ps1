@@ -458,6 +458,7 @@ $groupsWithErrors = ($Results | Select-Object -ExpandProperty GroupId -Unique | 
     "# ElapsedTime:        $ElapsedFormatted"
     "# Transcript:         $TranscriptFile"
     "#"
+    '"GroupId","GroupName","GroupType","ODataType","ServiceInstance","CreatedDateTime","IsResolved","ErrorDetail"'
 ) | Set-Content -Path $OutFile -Encoding UTF8
 
 $Results |
@@ -472,6 +473,7 @@ if ($Skipped.Count -gt 0) {
         "# ScanStarted:  $ScanStartLocal"
         "# Reason codes: AuthExpired_401 | Forbidden_403 | RetryBudgetExhausted_429 | NetworkError | Error_HTTPNNN"
         "#"
+        '"GroupId","GroupName","GroupType","Reason","Detail"'
     ) | Set-Content -Path $SkippedFile -Encoding UTF8
 
     $Skipped |
