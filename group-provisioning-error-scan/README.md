@@ -1,4 +1,4 @@
-# Microsoft Graph serviceProvisioningErrors group scan
+# Microsoft Graph serviceProvisioningErrors Group Scan
 
 `MS-Graph-Enumerate-ServiceProvisioningErrors.ps1` scans Microsoft Entra ID security groups and distribution groups for Microsoft Graph `serviceProvisioningErrors` and exports the findings to CSV.
 
